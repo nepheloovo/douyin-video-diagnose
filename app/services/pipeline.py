@@ -25,9 +25,10 @@ from app.schemas.report import (
 )
 from app.schemas.request import DiagnoseRequest
 from app.services.frames import extract_frames_0_3s, save_cover_as_fallback
-from app.services.llm import LLMClient, get_llm_client
+from app.services.llm import LLMClient, get_llm_clients
 from app.services.mode import ModeDecision, decide_mode
 from app.services.parse import ParseResult, parse_aweme_url
+from app.services.prompts import load_system_prompt
 from app.services.store import Job, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -80,13 +81,14 @@ async def _run_expert(
     extra: str,
     mode: DegradationMode,
 ) -> DimensionResult:
-    system = (
+    fallback = (
         f"You are the {name} for Douyin short-video diagnosis. "
         f"Role marker: {marker}. "
         "「审核」means hook/retention quality, NEVER platform compliance or ban risk. "
         "Return JSON: {\"score\": number 0-100, \"findings\": "
         "[{\"claim\",\"evidence\",\"severity\": \"info|warn|critical\"}]}."
     )
+    system = load_system_prompt(marker, fallback)
     user = json.dumps(
         {
             "mode": mode.value,
@@ -118,12 +120,13 @@ async def _run_debate(
     *,
     mode: DegradationMode,
 ) -> tuple[list[dict[str, Any]], list[Disagreement]]:
-    system = (
+    fallback = (
         "You facilitate a written debate among three Douyin experts "
         "(content / visual / growth). Role marker: cross_critique. "
         "Return JSON: {\"critiques\":[{\"from_expert\",\"to_expert\",\"point\"}], "
         "\"disagreements\":[{\"topic\",\"sides\":{expert:stance}}]}."
     )
+    system = load_system_prompt("cross_critique", fallback)
     user = json.dumps(
         {
             "mode": mode.value,
@@ -154,7 +157,7 @@ async def _run_judge(
     caption: str,
     frames_summary: str,
 ) -> dict[str, Any]:
-    system = (
+    fallback = (
         "You are the Judge for Douyin video diagnose. Role marker: judge. "
         "Judge is REQUIRED. Aggregate expert findings into a final report. "
         "「审核」= hook/retention, not compliance. "
@@ -162,6 +165,7 @@ async def _run_judge(
         "top3_fixes (max 3: title/why/how/expected_effect), do_not, "
         "and optional disagreement resolutions."
     )
+    system = load_system_prompt("judge", fallback)
     user = json.dumps(
         {
             "mode": mode.value,
@@ -218,7 +222,7 @@ def _frames_summary(frames: list[FrameMeta]) -> str:
 async def run_diagnose_job(job: Job, inputs: JobInputs) -> None:
     """Full pipeline for one job. Emits SSE phases along the way."""
     job.status = JobStatus.RUNNING
-    llm = get_llm_client(get_settings())
+    llm, judge_llm = get_llm_clients(get_settings())
     req = inputs.request
     work_dir = inputs.work_dir or (UPLOAD_ROOT / job.id)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -409,7 +413,7 @@ async def run_diagnose_job(job: Job, inputs: JobInputs) -> None:
         # Judge (required)
         _emit(job, EventPhase.JUDGE, "Judge aggregating final report", 0.85)
         judge_raw = await _run_judge(
-            llm,
+            judge_llm,
             mode=decision.mode,
             dimensions=dimensions,
             disagreements=disagreements,

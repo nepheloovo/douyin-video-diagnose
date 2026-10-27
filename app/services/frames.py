@@ -36,6 +36,20 @@ class FrameExtractResult:
     error: Optional[str] = None
 
 
+def resolve_ffmpeg() -> Optional[str]:
+    """Prefer a system ffmpeg, otherwise the imageio-ffmpeg bundled binary."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        return ffmpeg_bin
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        logger.debug("imageio-ffmpeg unavailable", exc_info=True)
+        return None
+
+
 async def extract_frames_0_3s(
     video_path: Path,
     out_dir: Path,
@@ -51,14 +65,7 @@ async def extract_frames_0_3s(
     if not video_path.exists():
         return FrameExtractResult(ok=False, error=f"video not found: {video_path}")
 
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        try:
-            import imageio_ffmpeg
-
-            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            ffmpeg_bin = None
+    ffmpeg_bin = resolve_ffmpeg()
     if not ffmpeg_bin:
         return FrameExtractResult(ok=False, error="ffmpeg not installed")
 
