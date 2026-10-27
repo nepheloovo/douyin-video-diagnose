@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: douyin-video-diagnose
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
