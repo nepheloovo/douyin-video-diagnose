@@ -1,15 +1,36 @@
-"""LLM client interface — OpenAI-compatible; deterministic mock without key."""
+"""LLM client interface — OpenAI-compatible; deterministic mock without a key."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+import re
+from dataclasses import dataclass
 from typing import Any, Optional, Protocol
+from urllib.parse import urlparse
 
 from app.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+# DeepSeek's OpenAI-compatible API. The SDK posts to {base}/chat/completions,
+# which this host serves (a /v1 suffix also works if set via OPENAI_BASE_URL).
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+
+_ROLE_MARKERS = (
+    "content_expert",
+    "visual_expert",
+    "growth_expert",
+    "cross_critique",
+    "judge",
+)
+_ROLE_LINE = re.compile(
+    r"Role marker:\s*(content_expert|visual_expert|growth_expert|cross_critique|judge)\b"
+)
 
 
 class LLMClient(Protocol):
@@ -23,17 +44,89 @@ class LLMClient(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class LLMEndpoint:
+    api_key: str
+    base_url: str
+    model: str
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+
+def _clean(value: str) -> str:
+    return (value or "").strip()
+
+
+def resolve_primary_endpoint(settings: Settings) -> LLMEndpoint:
+    """Pick key, base URL, and model.
+
+    OPENAI_API_KEY wins when it is set. DEEPSEEK_API_KEY is the alias used only
+    when the OpenAI key is empty, with DeepSeek's host and deepseek-chat unless
+    OPENAI_BASE_URL / OPENAI_MODEL are set.
+    """
+    openai_key = _clean(settings.openai_api_key)
+    deepseek_key = _clean(settings.deepseek_api_key)
+    base_override = _clean(settings.openai_base_url).rstrip("/")
+    model_override = _clean(settings.openai_model)
+
+    if openai_key:
+        return LLMEndpoint(
+            api_key=openai_key,
+            base_url=base_override or OPENAI_DEFAULT_BASE_URL,
+            model=model_override or OPENAI_DEFAULT_MODEL,
+        )
+    if deepseek_key:
+        return LLMEndpoint(
+            api_key=deepseek_key,
+            base_url=base_override or DEEPSEEK_BASE_URL,
+            model=model_override or DEEPSEEK_DEFAULT_MODEL,
+        )
+    return LLMEndpoint(
+        api_key="",
+        base_url=base_override or OPENAI_DEFAULT_BASE_URL,
+        model=model_override or OPENAI_DEFAULT_MODEL,
+    )
+
+
+def resolve_judge_endpoint(settings: Settings, primary: LLMEndpoint) -> Optional[LLMEndpoint]:
+    """Return a separate judge endpoint, or None to reuse `primary`.
+
+    JUDGE_MODEL wins over JUDGE_OPENAI_MODEL when both are set.
+    A model/base override without any API key stays on the mock client.
+    """
+    judge_key = _clean(settings.judge_openai_api_key)
+    judge_base = _clean(settings.judge_openai_base_url).rstrip("/")
+    judge_model = _clean(settings.judge_model) or _clean(settings.judge_openai_model)
+    if not judge_key and not judge_base and not judge_model:
+        return None
+
+    api_key = judge_key or primary.api_key
+    if not api_key:
+        return None
+
+    base_url = judge_base or primary.base_url
+    model = judge_model or primary.model
+    if (
+        primary.enabled
+        and api_key == primary.api_key
+        and base_url.rstrip("/") == primary.base_url.rstrip("/")
+        and model == primary.model
+    ):
+        return None
+    return LLMEndpoint(api_key=api_key, base_url=base_url, model=model)
+
+
 class OpenAICompatibleClient:
     """Thin async wrapper around the OpenAI Python SDK (compatible base_url)."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, *, api_key: str, base_url: str, model: str) -> None:
         from openai import AsyncOpenAI
 
-        self._model = settings.openai_model
-        self._client = AsyncOpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-        )
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self._client = AsyncOpenAI(api_key=api_key, base_url=self.base_url)
 
     async def complete_json(
         self,
@@ -43,7 +136,7 @@ class OpenAICompatibleClient:
         temperature: float = 0.3,
     ) -> dict[str, Any]:
         resp = await self._client.chat.completions.create(
-            model=self._model,
+            model=self.model,
             temperature=temperature,
             response_format={"type": "json_object"},
             messages=[
@@ -53,6 +146,17 @@ class OpenAICompatibleClient:
         )
         raw = resp.choices[0].message.content or "{}"
         return json.loads(raw)
+
+
+def _role_from_system(system: str) -> str:
+    """Prefer the explicit Role marker line (last one wins)."""
+    found = _ROLE_LINE.findall(system)
+    if found:
+        return found[-1]
+    for marker in _ROLE_MARKERS:
+        if marker in system:
+            return marker
+    return "generic"
 
 
 class MockLLMClient:
@@ -72,12 +176,7 @@ class MockLLMClient:
         user: str,
         temperature: float = 0.3,
     ) -> dict[str, Any]:
-        # Route by a marker the orchestrator puts in system prompts.
-        role = "generic"
-        for marker in ("content_expert", "visual_expert", "growth_expert", "cross_critique", "judge"):
-            if marker in system:
-                role = marker
-                break
+        role = _role_from_system(system)
 
         score_base = 55 + (self._digest(user) % 30)  # 55–84
 
@@ -189,10 +288,41 @@ class MockLLMClient:
         return {"note": "unrecognized role", "echo": user[:120]}
 
 
-def get_llm_client(settings: Optional[Settings] = None) -> LLMClient:
+def _host(url: str) -> str:
+    try:
+        return urlparse(url).netloc or url
+    except Exception:
+        return "unknown"
+
+
+def _client_for(endpoint: LLMEndpoint, *, role: str) -> LLMClient:
+    if not endpoint.enabled:
+        logger.warning("No LLM API key set — using deterministic MockLLMClient (%s)", role)
+        return MockLLMClient()
+    logger.info(
+        "Using OpenAI-compatible LLM for %s (host=%s model=%s)",
+        role,
+        _host(endpoint.base_url),
+        endpoint.model,
+    )
+    return OpenAICompatibleClient(
+        api_key=endpoint.api_key,
+        base_url=endpoint.base_url,
+        model=endpoint.model,
+    )
+
+
+def get_llm_clients(settings: Optional[Settings] = None) -> tuple[LLMClient, LLMClient]:
+    """Return (primary, judge). Judge is the same object when no override is set."""
     settings = settings or get_settings()
-    if settings.has_llm:
-        logger.info("Using OpenAI-compatible LLM (%s)", settings.openai_base_url)
-        return OpenAICompatibleClient(settings)
-    logger.warning("OPENAI_API_KEY unset — using deterministic MockLLMClient")
-    return MockLLMClient()
+    primary_ep = resolve_primary_endpoint(settings)
+    primary = _client_for(primary_ep, role="primary")
+    judge_ep = resolve_judge_endpoint(settings, primary_ep)
+    if judge_ep is None:
+        return primary, primary
+    return primary, _client_for(judge_ep, role="judge")
+
+
+def get_llm_client(settings: Optional[Settings] = None) -> LLMClient:
+    primary, _judge = get_llm_clients(settings)
+    return primary
