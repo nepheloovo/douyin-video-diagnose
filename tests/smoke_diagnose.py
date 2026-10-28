@@ -19,8 +19,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import Settings, get_settings  # noqa: E402
+from app.schemas.modes import DegradationMode, ParseErrorKind  # noqa: E402
+from app.schemas.report import FrameMeta  # noqa: E402
 from app.schemas.request import DiagnoseRequest  # noqa: E402
-from app.services.frames import resolve_ffmpeg  # noqa: E402
+from app.services.frames import resolve_ffmpeg, set_frame_extract_override  # noqa: E402
+from app.services.mode import decide_mode  # noqa: E402
+from app.services.parse import ParseResult  # noqa: E402
 from app.services.llm import (  # noqa: E402
     DEEPSEEK_BASE_URL,
     DEEPSEEK_DEFAULT_MODEL,
@@ -62,6 +66,26 @@ def check(cond: bool, message: str) -> None:
         raise SystemExit(f"FAIL: {message}")
 
 
+_RETIRED_MODES = ("caption_only", "cover_only")
+_LOCKED_MODES = ("video_3s", "cover_caption", "link_fail")
+
+
+def runtime_blob(job) -> str:
+    parts = [event.model_dump_json() for event in job.events]
+    if job.report is not None:
+        parts.append(job.report.model_dump_json())
+    return "".join(parts)
+
+
+def assert_no_retired_mode(blob: str, label: str) -> None:
+    for retired in _RETIRED_MODES:
+        check(retired not in blob, f"{label} emitted {retired}")
+
+
+def _phases(job) -> list[str]:
+    return [event.phase.value for event in job.events]
+
+
 def settings_from(**env: str) -> Settings:
     """Build Settings from an explicit env, ignoring ambient keys and the cache."""
     saved = {key: os.environ.get(key) for key in _LLM_ENV}
@@ -93,6 +117,9 @@ def test_prompts_load_five_files() -> None:
         check("FALLBACK_SHOULD_NOT_BE_USED" not in loaded, f"{marker} used fallback")
         check(_PHRASES[marker] in loaded, f"{marker} missing phrase from {filename}")
         check(role_marker_line(marker) in loaded.splitlines(), f"{marker} missing role line")
+        assert_no_retired_mode(loaded, f"prompt {filename}")
+        for mode in _LOCKED_MODES:
+            check(mode in loaded, f"{filename} missing locked mode {mode}")
         # Debate markdown mentions judge_resolution; the explicit line must still win.
         routed = _role(loaded)
         check(routed == marker, f"{marker} routed as {routed}")
@@ -126,7 +153,13 @@ class _Spy(MockLLMClient):
         return await super().complete_json(system=system, user=user, temperature=temperature)
 
 
-async def _run_cover_caption(spy: _Spy | None = None):
+async def _run_job(
+    req: DiagnoseRequest,
+    spy: _Spy | None = None,
+    *,
+    video_bytes: bytes | None = None,
+    cover_bytes: bytes | None = None,
+):
     import app.services.pipeline as pipeline
 
     original = pipeline.get_llm_clients
@@ -136,18 +169,38 @@ async def _run_cover_caption(spy: _Spy | None = None):
         # No keys: even if the patch is absent, the client must be the mock.
         get_settings.cache_clear()
         job = job_store.create()
-        req = DiagnoseRequest(
-            caption="前三秒还在讲背景，没有给出结果。今天分享一个方法。",
-            cover_url="https://example.com/cover.jpg",
-        )
         with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            video_path = None
+            cover_path = None
+            if video_bytes is not None:
+                video_path = work / "input.mp4"
+                video_path.write_bytes(video_bytes)
+            if cover_bytes is not None:
+                cover_path = work / "cover.jpg"
+                cover_path.write_bytes(cover_bytes)
             await pipeline.run_diagnose_job(
                 job,
-                JobInputs(request=req, work_dir=Path(tmp)),
+                JobInputs(
+                    request=req,
+                    work_dir=work,
+                    video_path=video_path,
+                    cover_path=cover_path,
+                ),
             )
         return job
     finally:
         pipeline.get_llm_clients = original
+
+
+async def _run_cover_caption(spy: _Spy | None = None):
+    return await _run_job(
+        DiagnoseRequest(
+            caption="前三秒还在讲背景，没有给出结果。今天分享一个方法。",
+            cover_url="https://example.com/cover.jpg",
+        ),
+        spy,
+    )
 
 
 def test_mock_pipeline_loads_prompts() -> None:
@@ -178,9 +231,11 @@ def test_mock_pipeline_loads_prompts() -> None:
     )
     for system, marker in zip(spy.systems, roles):
         check(_PHRASES[marker] in system, f"pipeline did not load {marker} markdown")
-    blob = report.model_dump_json() + "".join(event.model_dump_json() for event in job.events)
+    blob = runtime_blob(job)
     for leak in _MODEL_LEAKS:
         check(leak not in blob, f"model name {leak} leaked into the public payload")
+    assert_no_retired_mode(blob, "cover_caption report")
+    check(report.mode.value in _LOCKED_MODES, f"unlocked mode {report.mode}")
 
 
 def test_missing_prompts_still_finish() -> None:
@@ -347,16 +402,267 @@ def test_http_snapshot_contract() -> None:
         blob = resp.text
         for leak in _MODEL_LEAKS:
             check(leak not in blob, f"model name {leak} in snapshot")
+        assert_no_retired_mode(blob, "http snapshot")
+        check(report["mode"] == "cover_caption", f"http mode {report['mode']}")
+        check("frames_extract_unavailable" in report["degradation_flags"], "yellow-bar flags missing")
+
+
+def _dim(report, name: str):
+    return next(dim for dim in report.dimensions if dim.name == name)
+
+
+def test_mode_enum_is_locked() -> None:
+    values = tuple(mode.value for mode in DegradationMode)
+    check(values == _LOCKED_MODES, f"DegradationMode values {values}")
+
+
+def test_decide_mode_locked_table() -> None:
+    frames = decide_mode(
+        has_cover=False,
+        has_caption=True,
+        aweme_url=None,
+        parse=None,
+        has_frames=True,
+    )
+    check(frames.mode == DegradationMode.VIDEO_3S, f"frames mode {frames.mode}")
+    check(frames.run_content and frames.run_visual and frames.run_growth, "video_3s skipped an expert")
+    check(frames.link_fail is False, "video_3s marked link_fail")
+
+    url_fail = ParseResult(
+        ok=False,
+        error_kind=ParseErrorKind.FETCH_BLOCKED,
+        error_message="blocked",
+        degradation_flags=["url_fetch:fetch_blocked"],
+    )
+    yellow = decide_mode(
+        has_cover=True,
+        has_caption=True,
+        aweme_url="https://v.douyin.com/abc/",
+        parse=url_fail,
+        has_frames=False,
+    )
+    check(yellow.mode == DegradationMode.COVER_CAPTION, f"yellow mode {yellow.mode}")
+    check(yellow.link_fail is False, "cover+caption after URL fail took link_fail")
+    check(yellow.run_content and yellow.run_visual and yellow.run_growth, "yellow path skipped an expert")
+    check("frames_extract_unavailable" in yellow.degradation_flags, "yellow flags missing frames")
+    check("url_fetch:fetch_blocked" in yellow.degradation_flags, "yellow flags dropped parse failure")
+    check("link_fail" not in yellow.degradation_flags, "yellow path set link_fail flag")
+
+    caption = decide_mode(
+        has_cover=False,
+        has_caption=True,
+        aweme_url="https://example.com/nope",
+        parse=url_fail,
+        has_frames=False,
+        video_attempted=True,
+    )
+    check(caption.mode == DegradationMode.COVER_CAPTION, f"caption degrade {caption.mode}")
+    check(caption.run_growth and caption.run_content and not caption.run_visual, "caption degrade expert set")
+    check("skip:visual" in caption.degradation_flags, "caption degrade missing skip:visual")
+
+    cover = decide_mode(
+        has_cover=True,
+        has_caption=False,
+        aweme_url=None,
+        parse=None,
+        has_frames=False,
+    )
+    check(cover.mode == DegradationMode.COVER_CAPTION, f"cover degrade {cover.mode}")
+    check(cover.run_visual and not cover.run_growth, "cover degrade expert set")
+
+    bare = decide_mode(
+        has_cover=False,
+        has_caption=False,
+        aweme_url="https://www.douyin.com/video/7123456789012345678",
+        parse=ParseResult(ok=False, error_kind=ParseErrorKind.PARSE_ERROR, error_message="bad link"),
+        has_frames=False,
+    )
+    check(bare.mode == DegradationMode.LINK_FAIL and bare.link_fail, f"bare link {bare.mode}")
+    check(not (bare.run_content or bare.run_visual or bare.run_growth), "link_fail still runs experts")
+    check(bool(bare.error_message and bare.actionable), "link_fail missing guidance")
+
+    upload = decide_mode(
+        has_cover=False,
+        has_caption=False,
+        aweme_url=None,
+        parse=None,
+        has_frames=False,
+        video_attempted=True,
+    )
+    check(upload.mode == DegradationMode.LINK_FAIL and upload.link_fail, f"upload fail {upload.mode}")
+    check("frames_extract_unavailable" in upload.degradation_flags, "upload fail missing frame flag")
+
+
+def test_pipeline_mode_paths() -> None:
+    caption_without_cover = DiagnoseRequest(caption="只有文案，没有封面，抽帧也没有发生。")
+    job = asyncio.run(_run_job(caption_without_cover))
+    check(job.status == JobStatus.DONE, f"caption degrade status {job.status} {job.error}")
+    report = job.report
+    assert report is not None
+    check(report.mode == DegradationMode.COVER_CAPTION, f"caption degrade mode {report.mode}")
+    check(_dim(report, "visual").skipped, "caption degrade ran visual")
+    check(not _dim(report, "content").skipped and not _dim(report, "growth").skipped, "caption degrade skipped text experts")
+    for phase in ("experts", "debate", "judge", "done"):
+        check(phase in _phases(job), f"caption degrade missing {phase}")
+    check(len(report.top3_fixes) == 3, "caption degrade dropped top3")
+    assert_no_retired_mode(runtime_blob(job), "caption degrade payload")
+
+    cover_job = asyncio.run(
+        _run_job(DiagnoseRequest(cover_url="https://example.com/cover.jpg"))
+    )
+    assert cover_job.report is not None
+    check(cover_job.report.mode == DegradationMode.COVER_CAPTION, f"cover degrade {cover_job.report.mode}")
+    check(_dim(cover_job.report, "growth").skipped, "cover degrade ran growth")
+    check(not _dim(cover_job.report, "visual").skipped, "cover degrade skipped visual")
+    assert_no_retired_mode(runtime_blob(cover_job), "cover degrade payload")
+
+    yellow = asyncio.run(
+        _run_job(
+            DiagnoseRequest(
+                aweme_url="https://example.com/not-a-douyin-link",
+                caption="链接失败，但封面和文案还在。",
+                cover_url="https://example.com/cover.jpg",
+            )
+        )
+    )
+    assert yellow.report is not None
+    check(yellow.report.mode == DegradationMode.COVER_CAPTION, f"url+cover mode {yellow.report.mode}")
+    check(yellow.status == JobStatus.DONE, f"url+cover status {yellow.status}")
+    names = {dim.name for dim in yellow.report.dimensions if not dim.skipped}
+    check(names == {"content", "visual", "growth"}, f"url+cover experts {names}")
+    check("frames_extract_unavailable" in yellow.report.degradation_flags, "url+cover flags")
+    check("url_parse:parse_error" in yellow.report.degradation_flags, "url+cover dropped parse flag")
+    parsing = next(event for event in yellow.events if event.data and "link_fail" in event.data)
+    check(parsing.data["link_fail"] is False, "yellow bar event marked link_fail")
+    for phase in ("experts", "debate", "judge", "done"):
+        check(phase in _phases(yellow), f"yellow bar missing {phase}")
+    assert_no_retired_mode(runtime_blob(yellow), "yellow bar payload")
+
+    spy = _Spy()
+    link = asyncio.run(
+        _run_job(
+            DiagnoseRequest(aweme_url="https://www.douyin.com/video/7123456789012345678"),
+            spy,
+        )
+    )
+    assert link.report is not None
+    check(link.report.mode == DegradationMode.LINK_FAIL, f"id-only mode {link.report.mode}")
+    check(link.report.dimensions == [], "link_fail invented dimensions")
+    check(link.report.top3_fixes == [], "link_fail invented top3")
+    check(bool(link.report.one_liner) and bool(link.report.verdict), "link_fail missing guidance")
+    check(spy.systems == [], f"link_fail called the LLM {len(spy.systems)} times")
+    got = _phases(link)
+    for banned in ("experts", "debate", "judge"):
+        check(banned not in got, f"link_fail emitted {banned}: {got}")
+    check(got[0] == "parsing" and got[-1] == "done", f"link_fail phases {got}")
+    done = link.events[-1]
+    check(bool(done.error_code), "link_fail done missing error_code")
+    check(bool((done.data or {}).get("actionable")), "link_fail done missing actionable")
+    assert_no_retired_mode(runtime_blob(link), "link_fail payload")
+
+    set_frame_extract_override(
+        inject=[FrameMeta(path="frame_000.jpg", t_sec=0.0, source="video_0_3s")]
+    )
+    try:
+        video = asyncio.run(
+            _run_job(
+                DiagnoseRequest(caption="上传视频并且抽出了前三秒。"),
+                video_bytes=b"not-a-real-video",
+            )
+        )
+    finally:
+        set_frame_extract_override()
+    assert video.report is not None
+    check(video.report.mode == DegradationMode.VIDEO_3S, f"frames mode {video.report.mode}")
+    check(not any(dim.skipped for dim in video.report.dimensions), "video_3s skipped an expert")
+    assert_no_retired_mode(runtime_blob(video), "video_3s payload")
+
+    set_frame_extract_override(force_fail=True)
+    try:
+        failed_with_caption = asyncio.run(
+            _run_job(
+                DiagnoseRequest(caption="抽帧失败，但文案还在。"),
+                video_bytes=b"not-a-real-video",
+            )
+        )
+        failed_bare = asyncio.run(
+            _run_job(
+                DiagnoseRequest(video_present=True),
+                video_bytes=b"not-a-real-video",
+            )
+        )
+    finally:
+        set_frame_extract_override()
+    assert failed_with_caption.report is not None
+    check(
+        failed_with_caption.report.mode == DegradationMode.COVER_CAPTION,
+        f"frame-fail caption mode {failed_with_caption.report.mode}",
+    )
+    check(
+        any(flag.startswith("frames_fail:") for flag in failed_with_caption.report.degradation_flags),
+        "frame-fail caption missing frames_fail",
+    )
+    check(
+        "frames_extract_unavailable" in failed_with_caption.report.degradation_flags,
+        "frame-fail caption missing yellow flag",
+    )
+    check("experts" in _phases(failed_with_caption), "frame-fail caption skipped experts")
+    assert_no_retired_mode(runtime_blob(failed_with_caption), "frame-fail caption payload")
+
+    assert failed_bare.report is not None
+    check(failed_bare.report.mode == DegradationMode.LINK_FAIL, f"frame-fail bare {failed_bare.report.mode}")
+    check(failed_bare.report.top3_fixes == [], "frame-fail bare invented top3")
+    check(failed_bare.report.dimensions == [], "frame-fail bare invented findings")
+    check("experts" not in _phases(failed_bare), "frame-fail bare ran experts")
+    assert_no_retired_mode(runtime_blob(failed_bare), "frame-fail bare payload")
+
+
+def test_http_link_fail_skips_experts() -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    get_settings.cache_clear()
+    with TestClient(app) as client:
+        created = client.post(
+            "/diagnose",
+            data={"aweme_url": "https://www.douyin.com/video/7123456789012345678"},
+        )
+        check(created.status_code == 200, f"link_fail POST {created.status_code} {created.text}")
+        job_id = created.json().get("job_id")
+        snapshot = None
+        for _ in range(100):
+            resp = client.get(f"/diagnose/{job_id}/snapshot")
+            check(resp.status_code == 200, f"link_fail snapshot {resp.status_code}")
+            snapshot = resp.json()
+            if snapshot["status"] in ("done", "error"):
+                break
+        assert snapshot is not None
+        check(snapshot["status"] == "done", f"link_fail http {snapshot['status']} {snapshot.get('error')}")
+        phases = [event["phase"] for event in snapshot["events"]]
+        for banned in ("experts", "debate", "judge"):
+            check(banned not in phases, f"link_fail http emitted {banned}")
+        check("parsing" in phases and phases[-1] == "done", f"link_fail http phases {phases}")
+        report = snapshot["report"]
+        check(report["mode"] == "link_fail", f"link_fail http mode {report['mode']}")
+        check(report["top3_fixes"] == [], "link_fail http invented top3")
+        check(report["dimensions"] == [], "link_fail http invented dimensions")
+        check(bool(report["one_liner"]), "link_fail http missing guidance")
+        assert_no_retired_mode(resp.text, "link_fail http snapshot")
 
 
 def main() -> None:
     test_prompts_load_five_files()
     test_missing_prompt_falls_back()
+    test_mode_enum_is_locked()
+    test_decide_mode_locked_table()
     test_mock_pipeline_loads_prompts()
     test_missing_prompts_still_finish()
+    test_pipeline_mode_paths()
     test_deepseek_alias_and_openai_precedence()
     test_ffmpeg_resolver()
     test_http_snapshot_contract()
+    test_http_link_fail_skips_experts()
     print("smoke_diagnose: ok")
 
 

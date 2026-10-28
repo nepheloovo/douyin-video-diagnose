@@ -4,23 +4,16 @@ from enum import Enum
 
 
 class DegradationMode(str, Enum):
-    """MVP modes — prefer video_3s when frames_0_3s exist.
+    """Locked product modes — no fourth mode.
 
-    video_3s       — main path: first-3s frames + caption
-    cover_caption  — frame extract failed; cover + caption (yellow-flag)
-    caption_only   — caption only
-    cover_only     — cover only
-    link_fail      — URL-only and parse failed
-    full           — legacy alias for metadata-only (cover+caption+url meta);
-                     demoted; prefer video_3s when frames exist
+    video_3s       — main path: first-3s frames exist
+    cover_caption  — no frames; cover and/or caption still usable (yellow bar)
+    link_fail      — URL/video failed and no cover or caption; error only
     """
 
     VIDEO_3S = "video_3s"
     COVER_CAPTION = "cover_caption"
-    CAPTION_ONLY = "caption_only"
-    COVER_ONLY = "cover_only"
     LINK_FAIL = "link_fail"
-    FULL = "full"  # legacy / demoted — metadata-only, not full-frame analysis
 
 
 class VideoSource(str, Enum):
@@ -36,16 +29,18 @@ class ParseErrorKind(str, Enum):
     TIMEOUT = "timeout"
 
 
-# Mode selection table (MVP — no full-video frame analysis; that is P1):
+# Mode selection (MVP — no full-video frame analysis; that is P1):
 #
-# | frames_0_3s | cover | caption | mode           | experts                    |
-# |-------------|-------|---------|----------------|----------------------------|
-# | Y           | *     | Y       | video_3s       | Content+Visual+Growth      |
-# | Y           | *     | N       | video_3s*      | Visual+Content light       |
-# | N           | Y     | Y       | cover_caption  | Content+Visual+Growth (⚠️) |
-# | N           | N     | Y       | caption_only   | Content+Growth             |
-# | N           | Y     | N       | cover_only     | Visual (+Content light)    |
-# | only url fail | —   | —       | link_fail      | none — business 4xx        |
+# | frames_0_3s | cover or caption                         | mode          | pipeline                         |
+# |-------------|------------------------------------------|---------------|----------------------------------|
+# | Y           | *                                        | video_3s      | Content+Visual+Growth            |
+# | N           | any of cover_url / cover_file / caption | cover_caption | experts + debate + judge (⚠️)    |
+# | N           | none                                     | link_fail     | none — error / guidance only     |
 #
-# * caption empty with frames still uses video_3s but Growth may skip.
+# video_3s with an empty caption still runs, but Growth may skip.
+# cover_caption with only one of cover/caption still uses that mode; the
+# missing side is skipped and recorded on degradation_flags.
 # 「审核」= hook/retention diagnosis, NOT compliance / 限流 audit.
+
+# Scope token sent to experts. Must not collide with a mode name.
+DIAGNOSE_SCOPE = "first_3_seconds_and_caption"

@@ -37,14 +37,14 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `{{mode}}` | `video_3s \| cover_caption \| caption_only \| cover_only \| link_fail \| full` | 当前降级模式 |
+| `{{mode}}` | `video_3s \| cover_caption \| link_fail` | 当前降级模式 |
 | `{{video_source}}` | `url \| upload \| null` | 视频来源，仅用于理解信号条件 |
 | `{{caption}}` | `string` | 合并后的文案，可能为空 |
 | `{{frames_0_3s}}` | `string` | 前 3 秒帧摘要，格式如 `video_0_3s@0.0s:frame_000.jpg; ...`，可能为空 |
 | `{{cover}}` | `string` | 封面路径或 URL，可能为空 |
 | `{{extra_notes}}` | `string` | 用户补充信息；只有明确包含文案、ASR、字幕或数据时才可作为证据 |
 | `{{degradation_flags}}` | `string[]` | 降级原因，如 `skip:growth`、`caption_empty_with_frames` |
-| `scope` | `string` | 固定为 `first_3_seconds_and_caption_only` |
+| `scope` | `string` | 固定为 `first_3_seconds_and_caption` |
 
 输入示意：
 
@@ -58,18 +58,15 @@
   "cover": "{{cover}}",
   "extra_notes": "{{extra_notes}}",
   "degradation_flags": {{degradation_flags}},
-  "scope": "first_3_seconds_and_caption_only"
+  "scope": "first_3_seconds_and_caption"
 }
 ```
 
 ### 模式对证据的影响
 
 - `video_3s`：可同时使用前 3 秒帧与文案；若文案为空，本专家通常应被跳过。若仍被调用，只能基于画面做保守判断，并明确标注 `caption` 缺失。
-- `cover_caption`：只能使用封面与文案；不得声称看过前 3 秒画面。
-- `caption_only`：只能使用文案；不得推断画面、封面、音乐或口播。
-- `cover_only`：没有文案，通常应跳过增长判断；若仍被调用，只能评估“封面承诺是否给出继续观看理由”，不得编造文案。
+- `cover_caption`：没有可用前 3 秒帧。有文案时只根据文案以及实际提供的封面判断，不得声称看过前 3 秒画面，没有封面时不得推断画面。没有文案时本专家通常应被跳过；若仍被调用，只能评估“封面承诺是否给出继续观看理由”，不得编造文案。
 - `link_fail`：没有可诊断信号；本专家不应被调用。若仍被调用，返回 `score: null` 与一条证据不足说明。
-- `full`：本产品中仅为 legacy 元数据模式，**不代表全视频分析**；仍只按前 3 秒与文案处理。
 
 ## 3. 诊断清单
 
