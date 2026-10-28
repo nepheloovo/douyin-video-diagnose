@@ -23,7 +23,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `{{mode}}` | `video_3s \| cover_caption \| caption_only \| cover_only \| link_fail \| full` | 当前降级模式 |
+| `{{mode}}` | `video_3s \| cover_caption \| link_fail` | 当前降级模式 |
 | `{{dimensions}}` | `array<DimensionResult>` | 三位专家的结构化输出，按 `content` / `visual` / `growth` 排列 |
 | `{{degradation_flags}}` | `string[]` | 降级原因，用于判断哪些专家没有证据 |
 | `scope` | `string` | 固定为 `written_cross_critique_only` |

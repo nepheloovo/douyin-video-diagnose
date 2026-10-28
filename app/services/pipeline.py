@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from app.config import get_settings
 from app.schemas.events import DiagnoseEvent, EventPhase
-from app.schemas.modes import DegradationMode, VideoSource
+from app.schemas.modes import DIAGNOSE_SCOPE, DegradationMode, VideoSource
 from app.schemas.report import (
     DiagnoseReport,
     DimensionResult,
@@ -96,7 +96,7 @@ async def _run_expert(
             "frames_0_3s": frames_summary,
             "cover": cover_note,
             "extra_notes": extra,
-            "scope": "first_3_seconds_and_caption_only",
+            "scope": DIAGNOSE_SCOPE,
         },
         ensure_ascii=False,
     )
@@ -281,6 +281,7 @@ async def run_diagnose_job(job: Job, inputs: JobInputs) -> None:
             aweme_url=req.aweme_url,
             parse=parse,
             has_frames=bool(frames),
+            video_attempted=bool(inputs.video_path and inputs.video_path.exists()),
         )
         if frame_error and not frames:
             decision.degradation_flags.append(f"frames_fail:{frame_error[:80]}")

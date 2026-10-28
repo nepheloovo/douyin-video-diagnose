@@ -22,7 +22,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `{{mode}}` | `video_3s \| cover_caption \| caption_only \| cover_only \| link_fail \| full` | 当前降级模式 |
+| `{{mode}}` | `video_3s \| cover_caption \| link_fail` | 当前降级模式 |
 | `{{caption}}` | `string` | 合并文案，仅用于判断画面是否支撑文案，不作为画面事实来源 |
 | `{{frames_0_3s}}` | `array<FrameMeta> \| string` | 前 3 秒帧列表或摘要；`FrameMeta = {path, t_sec, source}` |
 | `{{frame_images}}` | `string` | 运行时附带的帧图片引用；没有附带时必须写 `null` 或空 |
@@ -184,7 +184,7 @@ frames_0_3s 不可用；cover=<cover_path>：<可观察事实>（仅封面证据
 6. **不做合规判断。** 不讨论违规、限流、封号、敏感词、版权、广告法、审核通过率；「审核」只指 hook/retention。
 7. **不使用 cookies。** 不请求、不假设登录态、私有接口、平台后台数据或抓包数据。
 8. **`frame_readings` 完整。** `frames_0_3s` 有 N 个帧就写 N 条；无帧时写 `[]`，并在 `findings` 中说明“`frames_0_3s` 不可用”。
-9. **无帧降级。** 若 `mode=cover_caption` 或 `cover_only`，只能基于封面评分；`frame_readings` 必须为 `[]`；`findings` 的证据必须写 `frames_0_3s 不可用` + `cover=...`，不得声称看过前 3 秒。
+9. **无帧降级。** 若 `mode=cover_caption`，只能基于实际提供的封面评分；没有封面时不得编造画面。`frame_readings` 必须为 `[]`；`findings` 的证据必须写 `frames_0_3s 不可用`，有封面时再写 `cover=...`，不得声称看过前 3 秒。
 10. **数量与严重度克制。** `findings` 1–5 条；`critical` 不超过 1 条；真实优势用 `info`，普通问题用 `warn`。
 11. **不越权。** 不替内容专家判断文案好坏，不替增长专家判断完播/互动，不替裁判给最终 Top3。
 12. **输出纯净。** 只输出 JSON；不要 Markdown、不要注释、不要额外字段。

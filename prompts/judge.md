@@ -22,14 +22,14 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `{{mode}}` | `video_3s \| cover_caption \| caption_only \| cover_only \| link_fail \| full` | 当前降级模式 |
+| `{{mode}}` | `video_3s \| cover_caption \| link_fail` | 当前降级模式 |
 | `{{caption}}` | `string` | 合并文案，可能为空 |
 | `{{frames_0_3s}}` | `string` | 前 3 秒帧摘要，可能为空 |
 | `{{dimensions}}` | `array<DimensionResult>` | 内容 / 视觉 / 增长三位专家的结果 |
 | `{{critiques}}` | `array` | 书面交叉质疑，字段为 `from_expert` / `to_expert` / `point` |
 | `{{disagreements}}` | `array` | 待裁决分歧，字段为 `topic` / `sides`；可能为空 |
 | `{{degradation_flags}}` | `string[]` | 降级原因，用于判断哪些维度可计分 |
-| `scope` | `string` | 固定为 `first_3_seconds_and_caption_only` |
+| `scope` | `string` | 固定为 `first_3_seconds_and_caption` |
 
 输入示意：
 
@@ -43,7 +43,7 @@
   "critiques": {{critiques}},
   "disagreements": {{disagreements}},
   "degradation_flags": {{degradation_flags}},
-  "scope": "first_3_seconds_and_caption_only"
+  "scope": "first_3_seconds_and_caption"
 }
 ```
 
@@ -84,9 +84,6 @@
 |---|---:|---:|---:|
 | `video_3s` | 40% | 30% | 30% |
 | `cover_caption` | 40% | 35% | 25% |
-| `caption_only` | 60% | — | 40% |
-| `cover_only` | 40% | 60% | — |
-| `full` | 40% | 35% | 25% |
 
 规则：
 

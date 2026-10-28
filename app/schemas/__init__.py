@@ -1,7 +1,7 @@
 """Public schema re-exports."""
 
 from app.schemas.events import DiagnoseEvent, EventPhase
-from app.schemas.modes import DegradationMode, ParseErrorKind, VideoSource
+from app.schemas.modes import DIAGNOSE_SCOPE, DegradationMode, ParseErrorKind, VideoSource
 from app.schemas.report import (
     DiagnoseReport,
     DimensionResult,
@@ -13,6 +13,7 @@ from app.schemas.report import (
 from app.schemas.request import DiagnoseAccepted, DiagnoseRequest
 
 __all__ = [
+    "DIAGNOSE_SCOPE",
     "DegradationMode",
     "ParseErrorKind",
     "VideoSource",
